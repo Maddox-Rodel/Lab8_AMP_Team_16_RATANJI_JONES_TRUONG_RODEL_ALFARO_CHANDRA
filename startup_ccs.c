@@ -4,20 +4,20 @@
 //
 // Copyright (c) 2012-2017 Texas Instruments Incorporated.  All rights reserved.
 // Software License Agreement
-// 
+//
 // Texas Instruments (TI) is supplying this software for use solely and
 // exclusively on TI's microcontroller products. The software is owned by
 // TI and/or its suppliers, and is protected under applicable copyright
 // laws. You may not combine this software with "viral" open-source
 // software in order to form a larger program.
-// 
+//
 // THIS SOFTWARE IS PROVIDED "AS IS" AND WITH ALL FAULTS.
 // NO WARRANTIES, WHETHER EXPRESS, IMPLIED OR STATUTORY, INCLUDING, BUT
 // NOT LIMITED TO, IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
 // A PARTICULAR PURPOSE APPLY TO THIS SOFTWARE. TI SHALL NOT, UNDER ANY
 // CIRCUMSTANCES, BE LIABLE FOR SPECIAL, INCIDENTAL, OR CONSEQUENTIAL
 // DAMAGES, FOR ANY REASON WHATSOEVER.
-// 
+//
 // This is part of revision 2.1.4.178 of the EK-TM4C123GXL Firmware Package.
 //
 //*****************************************************************************
@@ -62,7 +62,11 @@ extern void ADC0Seq1IntHandler(void);      // ADC0 SS1 done -> RIGHT sensor -> R
 // ===================== LAB 7 ADDITION =====================
 extern void ADC0Seq2IntHandler(void);      // ADC0 SS2 done -> FRONT sensor -> U-turn logic
 // ===================== LAB 7 ADDITION END =================
-extern void Timer2AIntHandler(void);       // 50 ms periodic timer -> triggers the FRONT sensor
+extern void Timer2AIntHandler(void);       // 30 ms periodic timer -> triggers the FRONT sensor
+// ===================== LINE: INTEGRATION ADDITION =====================
+extern void Timer1AIntHandler(void);       // LINE: one-shot -> read QTR-1RC (black / white)
+extern void Timer3AIntHandler(void);       // LINE: 5 ms periodic -> charge QTR-1RC
+// ===================== LINE: INTEGRATION ADDITION END =================
 
 //*****************************************************************************
 //
@@ -112,9 +116,9 @@ void (* const g_pfnVectors[])(void) =
     IntDefaultHandler,                      // Watchdog timer
     IntDefaultHandler,                      // Timer 0 subtimer A
     IntDefaultHandler,                      // Timer 0 subtimer B
-    IntDefaultHandler,                      // Timer 1 subtimer A
+    Timer1AIntHandler,                      // Timer 1 subtimer A  (LINE: read QTR-1RC)
     IntDefaultHandler,                      // Timer 1 subtimer B
-    Timer2AIntHandler,                      // Timer 2 subtimer A  (50 ms timer)
+    Timer2AIntHandler,                      // Timer 2 subtimer A  (30 ms timer)
     IntDefaultHandler,                      // Timer 2 subtimer B
     IntDefaultHandler,                      // Analog Comparator 0
     IntDefaultHandler,                      // Analog Comparator 1
@@ -126,7 +130,7 @@ void (* const g_pfnVectors[])(void) =
     IntDefaultHandler,                      // GPIO Port H
     IntDefaultHandler,                      // UART2 Rx and Tx
     IntDefaultHandler,                      // SSI1 Rx and Tx
-    IntDefaultHandler,                      // Timer 3 subtimer A
+    Timer3AIntHandler,                      // Timer 3 subtimer A  (LINE: 5 ms, charge QTR-1RC)
     IntDefaultHandler,                      // Timer 3 subtimer B
     IntDefaultHandler,                      // I2C1 Master and Slave
     IntDefaultHandler,                      // Quadrature Encoder 1

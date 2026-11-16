@@ -83,6 +83,17 @@ __error__(char *pcFilename, uint32_t ui32Line)
 //   RT-STRAIGHT drive straight RTURN_DELAY_AFTER_MS (0.5 s), right sensor ignored
 //   then back to PID with a fresh start (PidReset)
 //
+// INTEGRATION ADDITIONS (search "LINE:")
+//   QTR-1RC x2 on PD2 / PD3 (black line detection)
+//   Timer 3A ISR (every 5 ms): charge both sensors 10 us, switch to input,
+//                              start Timer 1A one-shot (LINE_BLACK_US)
+//   Timer 1A ISR (one-shot):   read the pins -- still HIGH = black
+//     1st thin line -> GREEN LED
+//     2nd thin line -> BLUE LED
+//     thick line    -> stop the robot, RED LED
+//   main(): flash RED for 1 minute after the thick line, then turn off
+//   LEDs now only show the lines (drive-mode LEDs removed)
+//
 //*****************************************************************************
 #include "driverlib/pwm.h"      // PWMGenConfigure(), PWMPulseWidthSet(), PWMOutputState()
 #include "driverlib/timer.h"    // TimerConfigure(), TimerLoadSet(), TimerEnable()
@@ -113,7 +124,7 @@ __error__(char *pcFilename, uint32_t ui32Line)
 // [WALL] Distances (all in cm) -- tune these in the maze
 //   wheel distance = right sensor distance - SENSOR_TO_WHEEL_CM
 //*****************************************************************************
-#define TARGET_CM           7.0f   // right wheel 10 cm from the wall
+#define TARGET_CM           10.0f   // right wheel 10 cm from the wall
 #define SENSOR_TO_WHEEL_CM  0.0f    // sensor is at the edge of the wheel
 #define INTERSECTION_CM     15.0f   // wheel-to-wall above this = opening -> right turn
 #define INTERSECTION_COUNT  2       // far readings in a row needed before starting the turn
@@ -160,9 +171,9 @@ __error__(char *pcFilename, uint32_t ui32Line)
 #define UTURN_PCT           50.0f   // U-turn: both wheels, opposite directions
 
 // TURN: timing of the right-turn sequence (ms)
-#define RTURN_DELAY_BEFORE_MS  1100  // TURN: straight past the opening before turning
-#define RTURN_TURN_MS          850  // TURN: pivot time -- tune until it turns 90 degrees
-#define RTURN_DELAY_AFTER_MS   1100  // TURN: straight after turning, right sensor ignored
+#define RTURN_DELAY_BEFORE_MS  500  // TURN: straight past the opening before turning
+#define RTURN_TURN_MS          800  // TURN: pivot time -- tune until it turns 90 degrees
+#define RTURN_DELAY_AFTER_MS   500  // TURN: straight after turning, right sensor ignored
 
 #define LEFT_PHASE_FWD      0       // PA2 level for forward
 #define RIGHT_PHASE_FWD     1       // PA3 level for forward (right motor is mirrored)
@@ -178,6 +189,37 @@ __error__(char *pcFilename, uint32_t ui32Line)
 #define RT_BEFORE   1               // straight, waiting to turn
 #define RT_TURN     2               // pivoting right
 #define RT_AFTER    3               // straight, right sensor ignored
+
+//*****************************************************************************
+// LINE: QTR-1RC reflectance sensors (RC output)
+//   PD2 = left QTR-1RC OUT, PD3 = right QTR-1RC OUT (VIN 5 V, GND)
+//   How it reads: drive the pin HIGH 10 us (charges the capacitor), make it
+//   an input, wait LINE_BLACK_US, then read it.
+//     white floor -> lots of IR reflected -> decays fast -> reads LOW
+//     black line  -> little IR reflected -> decays slow -> still HIGH
+//   Tune LINE_BLACK_US with the LIN command: hold the robot over the floor
+//   (should say W W) and over a black line (should say B on that sensor).
+//     floor reads B too -> raise LINE_BLACK_US
+//     line reads W      -> lower LINE_BLACK_US
+//*****************************************************************************
+#define LINE_PIN_L          GPIO_PIN_2      // PD2
+#define LINE_PIN_R          GPIO_PIN_3      // PD3
+#define LINE_PINS           (LINE_PIN_L | LINE_PIN_R)
+#define LINE_PERIOD_MS      5               // Timer 3A: one line reading every 5 ms
+#define LINE_CHARGE_US      10              // QTR-1RC needs at least 10 us
+#define LINE_BLACK_US       1000            // wait this long, then read  <-- TUNE
+
+// Thin vs thick = how long the robot sees black (robot speed matters)
+//   Watch LIV while driving over each line and tune THICK_MS.
+#define THIN_MIN_MS         10              // black shorter than this = noise
+#define THICK_MS            150             // black at least this long = thick line  <-- TUNE
+#define LINE_LOCKOUT_MS     500             // ignore lines right after a thin line
+#define THIN_MIN_SAMPLES    (THIN_MIN_MS / LINE_PERIOD_MS)
+#define THICK_SAMPLES       (THICK_MS / LINE_PERIOD_MS)
+#define LOCKOUT_SAMPLES     (LINE_LOCKOUT_MS / LINE_PERIOD_MS)
+
+#define FLASH_TOTAL_MS      60000           // flash RED for 1 minute
+#define FLASH_HALF_MS       250             // on 250 ms, off 250 ms
 
 //*****************************************************************************
 // [GLOBALS] volatile because ISRs write them and other code reads them
@@ -207,6 +249,18 @@ uint32_t PWMPeriod = 0;                 // PWM clocks per period, set in PWM_ini
 volatile char    CmdBuffer[CMD_LEN + 1];
 volatile uint8_t CmdIndex = 0;          // next empty slot in CmdBuffer
 volatile bool    CmdReady = false;      // true when 3 letters are waiting
+
+// LINE: line detection globals
+volatile bool     LineBlackL = false;   // last reading of each sensor (for LIN/LIV)
+volatile bool     LineBlackR = false;
+volatile uint32_t BlackSamples = 0;     // black readings in a row
+volatile uint32_t Lockout      = 0;     // readings left to ignore after a thin line
+volatile uint8_t  LineCount    = 0;     // thin lines seen (0, 1, 2)
+volatile uint32_t MsTicks      = 0;     // ms since power-up (+5 every Timer 3A)
+volatile uint32_t StartMs      = 0;     // STR time
+volatile uint32_t StopMs       = 0;     // thick line time
+volatile bool     Finished     = false; // true while the RED LED flashes
+uint32_t ChargeLoops = 0;               // SysCtlDelay loops for 10 us
 
 // Command table entry: 3-letter name + the function that runs it
 typedef struct
@@ -399,6 +453,133 @@ Timer2AIntHandler(void)
 }
 
 //*****************************************************************************
+// LINE: Line_init -- PD2/PD3 pins, Timer 3A (5 ms periodic), Timer 1A (one-shot)
+//*****************************************************************************
+void
+Line_init(void)
+{
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOD);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER1);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_TIMER3);
+    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_GPIOD))  {}
+    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER1)) {}
+    while(!SysCtlPeripheralReady(SYSCTL_PERIPH_TIMER3)) {}
+
+    GPIOPinTypeGPIOInput(GPIO_PORTD_BASE, LINE_PINS);
+
+    // SysCtlDelay = 3 clocks per loop -> 40 MHz / 3 / 1,000,000 x 10 us = 133
+    ChargeLoops = (SysCtlClockGet() / 3000000) * LINE_CHARGE_US;
+
+    // Timer 3A: periodic 5 ms -> starts each reading
+    // Load = 40 MHz / 1000 x 5 - 1 = 199,999
+    TimerConfigure(TIMER3_BASE, TIMER_CFG_PERIODIC);
+    TimerLoadSet(TIMER3_BASE, TIMER_A, (SysCtlClockGet() / 1000) * LINE_PERIOD_MS - 1);
+    TimerIntClear(TIMER3_BASE, TIMER_TIMA_TIMEOUT);
+    TimerIntEnable(TIMER3_BASE, TIMER_TIMA_TIMEOUT);
+    IntEnable(INT_TIMER3A);
+
+    // Timer 1A: one-shot LINE_BLACK_US -> read the pins when it runs out
+    // Load = 40 MHz / 1,000,000 x 1000 us - 1 = 39,999
+    TimerConfigure(TIMER1_BASE, TIMER_CFG_ONE_SHOT);
+    TimerLoadSet(TIMER1_BASE, TIMER_A, (SysCtlClockGet() / 1000000) * LINE_BLACK_US - 1);
+    TimerIntClear(TIMER1_BASE, TIMER_TIMA_TIMEOUT);
+    TimerIntEnable(TIMER1_BASE, TIMER_TIMA_TIMEOUT);
+    IntEnable(INT_TIMER1A);
+}
+
+//*****************************************************************************
+// LINE: Thick line -- stop the robot now, RED LED. main() flashes it for
+// 1 minute and then turns the robot off.
+//*****************************************************************************
+void RightTurnCancel(void);            // defined further down
+
+void
+RobotFinish(void)
+{
+    Running = false;                    // ADC ISRs stop driving the motors
+    SetMotors(0.0f, 0.0f);
+    SetDirection(true, true);
+    UTurnStatus = 0;
+    RightTurnCancel();
+    StopMs   = MsTicks;                 // race time ends here
+    Finished = true;
+    GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_RED);
+}
+
+//*****************************************************************************
+// LINE: [ISR] Timer 3A (every 5 ms) -- charge both sensors, then start the
+// Timer 1A one-shot. Timer 1A's ISR reads the result.
+//*****************************************************************************
+void
+Timer3AIntHandler(void)
+{
+    TimerIntClear(TIMER3_BASE, TIMER_TIMA_TIMEOUT);
+    MsTicks += LINE_PERIOD_MS;
+
+    GPIOPinTypeGPIOOutput(GPIO_PORTD_BASE, LINE_PINS);      // 1) drive HIGH
+    GPIOPinWrite(GPIO_PORTD_BASE, LINE_PINS, LINE_PINS);
+    SysCtlDelay(ChargeLoops);                               //    for 10 us
+    GPIOPinTypeGPIOInput(GPIO_PORTD_BASE, LINE_PINS);       // 2) let it decay
+
+    TimerEnable(TIMER1_BASE, TIMER_A);                      // 3) read in LINE_BLACK_US
+}
+
+//*****************************************************************************
+// LINE: [ISR] Timer 1A (one-shot, LINE_BLACK_US after the charge)
+//   pin still HIGH = black. Either sensor black = robot is on a line.
+//   while black: count readings; THICK_SAMPLES in a row = thick line
+//                (stop right away, don't wait to cross it)
+//   black -> white after THIN_MIN..THICK readings = thin line
+//*****************************************************************************
+void
+Timer1AIntHandler(void)
+{
+    uint32_t ui32Pins;
+    bool     bBlack;
+
+    TimerIntClear(TIMER1_BASE, TIMER_TIMA_TIMEOUT);
+
+    ui32Pins   = GPIOPinRead(GPIO_PORTD_BASE, LINE_PINS);
+    LineBlackL = (ui32Pins & LINE_PIN_L) != 0;
+    LineBlackR = (ui32Pins & LINE_PIN_R) != 0;
+    bBlack     = LineBlackL || LineBlackR;
+
+    if(!Running)                        // only count lines while driving
+    {
+        BlackSamples = 0;
+        return;
+    }
+
+    if(Lockout > 0)                     // just crossed a thin line
+    {
+        Lockout--;
+        BlackSamples = 0;
+        return;
+    }
+
+    if(bBlack)
+    {
+        BlackSamples++;
+        if(BlackSamples >= THICK_SAMPLES)
+        {
+            RobotFinish();              // THICK LINE: stop + RED
+            BlackSamples = 0;
+        }
+    }
+    else
+    {
+        if(BlackSamples >= THIN_MIN_SAMPLES)    // (thick already stopped above)
+        {
+            LineCount++;                // THIN LINE
+            if(LineCount == 1)      GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_GREEN);
+            else if(LineCount == 2) GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_BLUE);
+            Lockout = LOCKOUT_SAMPLES;
+        }
+        BlackSamples = 0;
+    }
+}
+
+//*****************************************************************************
 // [ADC] ADC_init
 //   SS2 = front (CH1), 2 samples, triggered by the timer
 //   SS1 = right (CH0), 2 samples, triggered by the front ISR
@@ -470,7 +651,7 @@ PID(float fWheel)
     float   fRaw, fErr, fOld, fAdj;
     uint8_t k;
 
-    GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_GREEN);
+    // LINE: mode LED removed -- LEDs now show the black lines
 
     // Low-pass filter: each reading moves FiltWheel only part of the way
     // toward the new value, so single noisy readings barely matter.
@@ -525,7 +706,7 @@ PID(float fWheel)
 void
 RightTurn(void)
 {
-    GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_BLUE);
+    // LINE: mode LED removed
     SetDirection(true, !RTURN_RIGHT_REVERSE);   // right wheel backward if REVERSE = 1
     SetMotors(RTURN_LEFT_PCT, RTURN_RIGHT_PCT);
 }
@@ -540,7 +721,7 @@ RightTurnStart(void)
     RightTurnStatus = 1;
     RTState  = RT_BEFORE;
     RTTimeMs = 0;
-    GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_BLUE);
+    // LINE: mode LED removed
     DriveStraight();
 }
 
@@ -610,7 +791,7 @@ RightTurnCancel(void)
 void
 UTurn(void)
 {
-    GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, LED_RED);
+    // LINE: mode LED removed
     SetDirection(false, true);
     SetMotors(UTURN_PCT, UTURN_PCT);
 }
@@ -724,6 +905,19 @@ ADC0Seq1IntHandler(void)
 void
 CmdStart(void)
 {
+    if(Finished)                        // LINE: wait until the RED flashing is done
+    {
+        UARTSendBoth("\r\nSTR ignored: finish sequence running\r\n");
+        return;
+    }
+
+    LineCount    = 0;                   // LINE: fresh run
+    BlackSamples = 0;
+    Lockout      = 0;
+    GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, 0);
+    PWMGenEnable(PWM0_BASE, PWM_GEN_0); // LINE: back on if the last run shut it off
+    StartMs = MsTicks;                  // LINE: race time starts here
+
     PidReset();
     UTurnStatus = 0;
     RightTurnCancel();                  // TURN
@@ -773,6 +967,21 @@ CmdDistance(void)
     UARTSendBoth(Msg);
 }
 
+// LINE: LIN prints what each line sensor sees right now (W = white, B = black)
+void
+CmdLine(void)
+{
+    char Msg[64] = "\r\nLIN: L = ";
+
+    strcat(Msg, LineBlackL ? "B" : "W");
+    strcat(Msg, ", R = ");
+    strcat(Msg, LineBlackR ? "B" : "W");
+    strcat(Msg, ", thin lines = ");
+    AppendCm(Msg, (float)LineCount);
+    strcat(Msg, "\r\n");
+    UARTSendBoth(Msg);
+}
+
 //*****************************************************************************
 // LIVE: print one line with both sensors and the current mode.
 // Called from main() only (UARTSendBoth blocks, so never from an ISR).
@@ -781,16 +990,20 @@ CmdDistance(void)
 void
 PrintLive(void)
 {
-    char Msg[96] = "\r\nLIVE: Wheel = ";
+    char Msg[128] = "\r\nLIVE: Wheel = ";
 
     AppendCm(Msg, RightWheelCm);
     strcat(Msg, " cm, Right = ");
     AppendCm(Msg, RightDistanceCm);
     strcat(Msg, " cm, Front = ");
     AppendCm(Msg, FrontDistanceCm);
-    strcat(Msg, " cm, Mode = ");
+    strcat(Msg, " cm, Line = ");                                  // LINE
+    strcat(Msg, LineBlackL ? "B" : "W");
+    strcat(Msg, LineBlackR ? "B" : "W");
+    strcat(Msg, ", Mode = ");
 
-    if(!Running)                    strcat(Msg, "STOP");
+    if(Finished)                    strcat(Msg, "FINISH");        // LINE
+    else if(!Running)                    strcat(Msg, "STOP");
     else if(UTurnStatus)            strcat(Msg, "UTURN");
     else if(RTState == RT_BEFORE)   strcat(Msg, "RT-WAIT");       // TURN
     else if(RTState == RT_TURN)     strcat(Msg, "RT-TURN");       // TURN
@@ -818,6 +1031,7 @@ const Command CmdTable[] =
     { "STR", CmdStart    },
     { "STP", CmdStop     },
     { "DST", CmdDistance },
+    { "LIN", CmdLine     },             // LINE
     { "LIV", CmdLive     },
     { "HLP", CmdHelp     }
 };
@@ -826,7 +1040,7 @@ const Command CmdTable[] =
 void
 CmdHelp(void)
 {
-    UARTSendBoth("\r\nCommands: STR = start, STP = stop, DST = distances, LIV = live readout on/off, HLP = help\r\n");
+    UARTSendBoth("\r\nCommands: STR = start, STP = stop, DST = distances, LIN = line sensors, LIV = live readout on/off, HLP = help\r\n");
 }
 
 //*****************************************************************************
@@ -881,12 +1095,14 @@ main(void)
     ADC_init();         // front (SS2) + right (SS1) sensors
     PWM_init();         // motor PWM, outputs off until STR
     Timer_init();       // 30 ms timer
+    Line_init();        // LINE: QTR-1RC pins, Timer 3A (5 ms) + Timer 1A (one-shot)
+    TimerEnable(TIMER3_BASE, TIMER_A);  // LINE: line sensors always read (LIN works before STR)
 
 #if TEST_MODE == 0
     TimerEnable(TIMER2_BASE, TIMER_A);  // sensors always update; STR/STP only start/stop the motors
 #endif
 
-    UARTSendBoth("Lab 7: STR = start, STP = stop, DST = distances, LIV = live readout, HLP = help\r\n");
+    UARTSendBoth("Integration: STR = start, STP = stop, DST = distances, LIN = line sensors, LIV = live readout, HLP = help\r\n");
 
     while(1)
     {
@@ -899,6 +1115,39 @@ main(void)
         DriveStraight();                // both wheels same duty -> should go straight
 #endif
         // =========================================================================
+
+        // LINE: thick line seen -> print time, flash RED 1 minute, then turn off
+        if(Finished)
+        {
+            static bool bTimePrinted = false;
+            uint32_t ui32Elapsed = MsTicks - StopMs;
+
+            if(!bTimePrinted)
+            {
+                char Msg[64] = "\r\nFINISH! Race time = ";
+                AppendCm(Msg, (float)(StopMs - StartMs));
+                strcat(Msg, " ms\r\n");
+                UARTSendBoth(Msg);
+                bTimePrinted = true;
+            }
+
+            if(ui32Elapsed < FLASH_TOTAL_MS)
+            {
+                // on for 250 ms, off for 250 ms
+                GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL,
+                             ((ui32Elapsed / FLASH_HALF_MS) % 2 == 0) ? LED_RED : 0);
+            }
+            else
+            {
+                // Turn off the robot: lights off, motors off
+                GPIOPinWrite(GPIO_PORTF_BASE, LED_ALL, 0);
+                SetMotors(0.0f, 0.0f);
+                PWMGenDisable(PWM0_BASE, PWM_GEN_0);
+                Finished     = false;
+                bTimePrinted = false;
+                UARTSendBoth("\r\nRobot OFF\r\n");
+            }
+        }
 
         // LIVE: print a readout every STREAM_PERIOD_MS while LIV is on
         if(Streaming && (TickCount >= STREAM_TICKS))
